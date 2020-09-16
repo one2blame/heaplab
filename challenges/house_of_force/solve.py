@@ -34,10 +34,6 @@ def malloc(io, size, data):
     io.recvuntil("> ")
 
 
-def delta(x, y):
-    return (0xffffffffffffffff - x) + y
-
-
 def solve():
     io = conn()
 
