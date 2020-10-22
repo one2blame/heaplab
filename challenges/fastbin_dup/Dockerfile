@@ -1,19 +1,19 @@
 FROM ubuntu:18.04
 
-RUN DEBIAN_FRONTEND=noninteractive apt-get update -y && apt-get install -y \
+RUN DEBIAN_FRONTEND=noninteractive \
+    apt-get update --yes && apt-get install --yes \
     socat \
-&& rm -rf /var/lib/apt/lists/*
+&& rm --recursive --force /var/lib/apt/lists
 
-RUN useradd -m fastbin_dup
+RUN useradd --create-home fastbin_dup
 
 COPY .glibc /home/.glibc
 
 WORKDIR /home/fastbin_dup
-
 COPY fastbin_dup .
 COPY flag .
-RUN chown -R root:fastbin_dup /home/fastbin_dup && \
-    chmod -R 750 /home/fastbin_dup && \
+RUN chown --recursive root:fastbin_dup /home/fastbin_dup && \
+    chmod --recursive 750 /home/fastbin_dup && \
     chmod 740 /home/fastbin_dup/flag
 
 EXPOSE 4444
