@@ -1,19 +1,19 @@
 FROM ubuntu:18.04
 
-RUN DEBIAN_FRONTEND=noninteractive apt-get update -y && apt-get install -y \
+RUN DEBIAN_FRONTEND=noninteractive \
+    apt-get update --yes && apt-get install --yes \
     socat \
-&& rm -rf /var/lib/apt/lists/*
+&& rm --recursive --force /var/lib/apt/lists
 
-RUN useradd -m house_of_force
+RUN useradd --create-home house_of_force
 
 COPY .glibc /home/.glibc
 
 WORKDIR /home/house_of_force
-
 COPY house_of_force .
 COPY flag .
-RUN chown -R root:house_of_force /home/house_of_force && \
-    chmod -R 750 /home/house_of_force && \
+RUN chown --recursive root:house_of_force /home/house_of_force && \
+    chmod --recursive 750 /home/house_of_force && \
     chmod 740 /home/house_of_force/flag
 
 EXPOSE 4444
