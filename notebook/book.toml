@@ -1,9 +1,0 @@
-[book]
-authors = ["one2blame"]
-language = "en"
-multilingual = false
-src = "src"
-title = "HeapLAB Notebook"
-
-[output.html]
-default-theme = "ayu"
